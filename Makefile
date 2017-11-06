@@ -4,7 +4,7 @@ LDFLAGS=
 LDLIBS=-lGL -lGLU -lglut
 
 TARGET=fluid
-SOURCES=src/demo.c src/solver.c
+SOURCES=src/demo.cpp src/solver.cpp
 
 all: $(TARGET)
 
