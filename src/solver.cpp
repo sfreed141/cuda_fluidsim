@@ -27,6 +27,7 @@ void set_bnd(int N, int b, float *x) {
     x[IX(N + 1, N + 1)] = 0.5f * (x[IX(N, N + 1)] + x[IX(N + 1, N)]);
 }
 
+//parallelize the contents of this function?
 void lin_solve(int N, int b, float *x, float *x0, float a, float c) {
     for (int k = 0; k < 20; k++) {
         for (int i = 1; i <= N; i++) {
