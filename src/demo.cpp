@@ -93,7 +93,8 @@ public:
     const float *const getU() const { return u; }
     const float *const getV() const { return v; }
     const float *const getDensity() const { return dens; }
-
+  
+//parallelize here?
     void draw_velocity() const {
         float h = 1.0f / N;
 
@@ -114,7 +115,7 @@ public:
 
         glEnd();
     }
-
+//prallelize here?
     void draw_density() const {
         float h = 1.0f / N;
 
