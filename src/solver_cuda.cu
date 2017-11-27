@@ -16,13 +16,6 @@
 
 static float *d_u, *d_v, *d_u0, *d_v0, *d_x, *d_x0;
 
-static void add_source(int N, float *x, float *s, float dt) {
-    int size = (N + 2) * (N + 2);
-    for (int i = 0; i < size; i++) {
-        x[i] += dt * s[i];
-    }
-}
-
 /* will be executed 1D with at least (N+2)^2 threads */
 __global__ void cuda_add_source(int N, float *x, const float *s, float dt) {
     int size = (N + 2) * (N + 2);
@@ -31,6 +24,48 @@ __global__ void cuda_add_source(int N, float *x, const float *s, float dt) {
     if (i < size) {
         x[i] += dt * s[i];
     }
+}
+
+static void call_cuda_add_source(int N, float *x, const float *s, float dt) {
+    int size = (N + 2) * (N + 2);
+
+    const dim3 blockSize(512, 1, 1);
+    const dim3 gridSize((size + blockSize.x - 1) / blockSize.x, 1, 1);
+    cuda_add_source<<<gridSize, blockSize>>>(N, x, s, dt);
+}
+
+static void add_source(int N, float *x, float *s, float dt) {
+    int size = (N + 2) * (N + 2);
+    for (int i = 0; i < size; i++) {
+        x[i] += dt * s[i];
+    }
+}
+
+/* executed 2D with (N+2)x(N+2) */
+/* this will be temporary (can just set bounds in other kernels) */
+__global__ void cuda_set_bnd(int N, int b, float *x) {
+    int tx = threadIdx.x + blockIdx.x * blockDim.x;
+    int ty = threadIdx.y + blockIdx.y * blockDim.y;
+
+    if (tx == 0)
+        x[IX(tx, ty)] = b == 1 ? -x[IX(1, ty)] : x[IX(1, ty)];
+    if (tx == N + 1)
+        x[IX(tx, ty)] = b == 1 ? -x[IX(N, ty)] : x[IX(N, ty)];
+    if (ty == 0)
+        x[IX(tx, ty)] = b == 2 ? -x[IX(tx, 1)] : x[IX(tx, 1)];
+    if (ty == N + 1)
+        x[IX(tx, ty)] = b == 2 ? -x[IX(tx, N)] : x[IX(tx, N)];
+
+    __syncthreads();
+
+    if (tx == 0 && ty == 0)
+        x[IX(tx, ty)] = 0.5f * (x[IX(1, 0)] + x[IX(0, 1)]);
+    if (tx == 0 && ty == N + 1)
+        x[IX(tx, ty)] = 0.5f * (x[IX(1, N + 1)] + x[IX(0, N)]);
+    if (tx == N + 1 && ty == 0)
+        x[IX(tx, ty)] = 0.5f * (x[IX(N, 0)] + x[IX(N + 1, 1)]);
+    if (tx == N + 1 && ty == N + 1)
+        x[IX(tx, ty)] = 0.5f * (x[IX(N, N + 1)] + x[IX(N + 1, N)]);
 }
 
 static void set_bnd(int N, int b, float *x) {
@@ -47,33 +82,6 @@ static void set_bnd(int N, int b, float *x) {
     x[IX(N + 1, N + 1)] = 0.5f * (x[IX(N, N + 1)] + x[IX(N + 1, N)]);
 }
 
-/* executed 2D with (N+2)x(N+2) */
-/* this will be temporary (can just set bounds in other kernels) */
-__global__ void cuda_set_bnd(int N, int b, float *x) {
-    int tx = threadIdx.x + blockIdx.x * blockDim.x;
-    int ty = threadIdx.y + blockIdx.y * blockDim.y;
-
-    if (tx == 0)
-        x[IX(tx, ty)] = b == 1 ? -x[IX(1, ty)] : x[IX(1, ty)];
-    if (tx == N + 1)
-        x[IX(tx, ty)] = b == 1 ? -x[IX(N, ty)] : x[IX(N, ty)];
-    if (ty == 0)
-        x[IX(tx, ty)] = b == 1 ? -x[IX(tx, 1)] : x[IX(tx, 1)];
-    if (ty == N + 1)
-        x[IX(tx, ty)] = b == 1 ? -x[IX(tx, N)] : x[IX(tx, N)];
-
-    __syncthreads();
-
-    if (tx == 0 && ty == 0)
-        x[IX(tx, ty)] = 0.5f * (x[IX(1, 0)] + x[IX(0, 1)]);
-    if (tx == 0 && ty == N + 1)
-        x[IX(tx, ty)] = 0.5f * (x[IX(1, N + 1)] + x[IX(0, N)]);
-    if (tx == N + 1 && ty == 0)
-        x[IX(tx, ty)] = 0.5f * (x[IX(N, 0)] + x[IX(N + 1, 1)]);
-    if (tx == N + 1 && ty == N + 1)
-        x[IX(tx, ty)] = 0.5f * (x[IX(N, N + 1)] + x[IX(N + 1, N)]);
-}
-
 /* executed 2D with N x N */
 __global__ void cuda_lin_solve(int N, int b, float *x, const float *x0, float a, float c) {
     int tx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -85,6 +93,36 @@ __global__ void cuda_lin_solve(int N, int b, float *x, const float *x0, float a,
     if (tx < N && ty < N) {
         x[IX(i, j)] = (x0[IX(i, j)] + a * (x[IX(i - 1, j)] + x[IX(i + 1, j)] + x[IX(i, j - 1)] + x[IX(i, j + 1)])) / c;
     }
+}
+
+static void call_cuda_lin_solve(int N, int b, float *x, const float *x0, float a, float c) {
+    for (int k = 0; k < 20; k++) {
+        cuda_lin_solve<<<dim3((N+16-1)/16, (N+16-1)/16, 1), dim3(16, 16, 1)>>>(N, b, x, x0, a, c);
+        cuda_set_bnd<<<dim3((N+2+16-1)/16, (N+2+16-1)/16, 1), dim3(16, 16, 1)>>>(N, b, x);
+    }
+}
+
+static void lin_solve(int N, int b, float *x, float *x0, float a, float c) {
+    for (int k = 0; k < 20; k++) {
+        for (int i = 1; i <= N; i++) {
+            for (int j = 1; j <= N; j++) {
+                x[IX(i, j)] = (x0[IX(i, j)] + a * (x[IX(i - 1, j)] + x[IX(i + 1, j)] + x[IX(i, j - 1)] + x[IX(i, j + 1)])) / c;
+            }
+        }
+        set_bnd(N, b, x);
+    }
+}
+
+static void call_cuda_diffuse(int N, int b, float *x, float *x0, float diff, float dt) {
+    float a = dt * diff * N * N;
+    float c = 1 + 4 * a;
+
+    call_cuda_lin_solve(N, b, x, x0, a, c);
+}
+
+static void diffuse(int N, int b, float *x, float *x0, float diff, float dt) {
+    float a = dt * diff * N * N;
+    lin_solve(N, b, x, x0, a, 1 + 4 * a);
 }
 
 /* execute 2D with NxN */
@@ -115,20 +153,9 @@ __global__ void cuda_advect(int N, int b, float *d, const float *d0, const float
     }
 }
 
-static void lin_solve(int N, int b, float *x, float *x0, float a, float c) {
-    for (int k = 0; k < 20; k++) {
-        for (int i = 1; i <= N; i++) {
-            for (int j = 1; j <= N; j++) {
-                x[IX(i, j)] = (x0[IX(i, j)] + a * (x[IX(i - 1, j)] + x[IX(i + 1, j)] + x[IX(i, j - 1)] + x[IX(i, j + 1)])) / c;
-            }
-        }
-        set_bnd(N, b, x);
-    }
-}
-
-static void diffuse(int N, int b, float *x, float *x0, float diff, float dt) {
-    float a = dt * diff * N * N;
-    lin_solve(N, b, x, x0, a, 1 + 4 * a);
+static void call_cuda_advect(int N, int b, float *d, const float *d0, const float *u, const float *v, float dt) {
+    cuda_advect<<<dim3((N+16-1)/16, (N+16-1)/16, 1), dim3(16, 16, 1)>>>(N, b, d, d0, u, v, dt);
+    cuda_set_bnd<<<dim3((N+2+16-1)/16, (N+2+16-1)/16, 1), dim3(16, 16, 1)>>>(N, b, d);
 }
 
 static void advect(int N, int b, float *d, float *d0, float *u, float *v, float dt) {
@@ -165,6 +192,46 @@ static void advect(int N, int b, float *d, float *d0, float *u, float *v, float 
     set_bnd(N, b, d);
 }
 
+__global__ void cuda_project0(int N, float *div, float *p, const float *u, const float *v) {
+    int tx = threadIdx.x + blockIdx.x * blockDim.x;
+    int ty = threadIdx.y + blockIdx.y * blockDim.y;
+
+    // account for NxN --> (N+2)x(N+2)
+    int i = tx + 1, j = ty + 1;
+
+    if (tx < N && ty < N) {
+        div[IX(i, j)] = -0.5f * (u[IX(i + 1, j)] - u[IX(i - 1, j)] + v[IX(i, j + 1)] - v[IX(i, j - 1)]) / N;
+        p[IX(i, j)] = 0;
+    }
+}
+
+__global__ void cuda_project1(int N, float *u, float *v, const float *p) {
+    int tx = threadIdx.x + blockIdx.x * blockDim.x;
+    int ty = threadIdx.y + blockIdx.y * blockDim.y;
+
+    // account for NxN --> (N+2)x(N+2)
+    int i = tx + 1, j = ty + 1;
+
+    if (tx < N && ty < N) {
+        u[IX(i, j)] -= 0.5f * N * (p[IX(i + 1, j)] - p[IX(i - 1, j)]);
+        v[IX(i, j)] -= 0.5f * N * (p[IX(i, j + 1)] - p[IX(i, j - 1)]);
+    }
+}
+
+static void call_cuda_project(int N, float *u, float *v, float *p, float *div) {
+    cuda_project0<<<dim3((N+16-1)/16, (N+16-1)/16, 1), dim3(16, 16, 1)>>>(N, div, p, u, v);
+
+    cuda_set_bnd<<<dim3((N+2+16-1)/16, (N+2+16-1)/16, 1), dim3(16, 16, 1)>>>(N, 0, div);
+    cuda_set_bnd<<<dim3((N+2+16-1)/16, (N+2+16-1)/16, 1), dim3(16, 16, 1)>>>(N, 0, p);
+
+    call_cuda_lin_solve(N, 0, p, div, 1, 4);
+
+    cuda_project1<<<dim3((N+16-1)/16, (N+16-1)/16, 1), dim3(16, 16, 1)>>>(N, u, v, p);
+
+    cuda_set_bnd<<<dim3((N+2+16-1)/16, (N+2+16-1)/16, 1), dim3(16, 16, 1)>>>(N, 1, u);
+    cuda_set_bnd<<<dim3((N+2+16-1)/16, (N+2+16-1)/16, 1), dim3(16, 16, 1)>>>(N, 2, v);
+}
+
 static void project(int N, float *u, float *v, float *p, float *div) {
     for (int i = 1; i <= N; i++) {
         for (int j = 1; j <= N; j++) {
@@ -191,67 +258,76 @@ void cuda_dens_step(int N, float *x, float *x0, const float *u, const float *v, 
     int size = (N + 2) * (N + 2);
     int mem_size = size * sizeof(float);
 
-    // Transfer arrays to the GPU    
     HANDLE_ERROR( cudaMemcpy(d_x, x, mem_size, cudaMemcpyHostToDevice) );
     HANDLE_ERROR( cudaMemcpy(d_x0, x0, mem_size, cudaMemcpyHostToDevice) );
     HANDLE_ERROR( cudaMemcpy(d_u, u, mem_size, cudaMemcpyHostToDevice) );
     HANDLE_ERROR( cudaMemcpy(d_v, v, mem_size, cudaMemcpyHostToDevice) );
 
-    // Add sources (from d_x0 to d_x)
-    {
-        const dim3 blockSize(512, 1, 1);
-        const dim3 gridSize((size + blockSize.x - 1) / blockSize.x, 1, 1);
-        cuda_add_source<<<gridSize, blockSize>>>(N, d_x, d_x0, dt);
-    }
+    // add_source(N, x, x0, dt);
+    call_cuda_add_source(N, d_x, d_x0, dt);
 
+    // SWAP(u0, u);
     SWAP(d_x0, d_x);
 
-    // Diffuse
-    {
-        float a = dt * diff * N * N;
-        float c = 1 + 4 * a;
-        for (int k = 0; k < 20; k++) {
-            cuda_lin_solve<<<dim3((N+16-1)/16, (N+16-1)/16, 1), dim3(16, 16, 1)>>>(N, 0, d_x, d_x0, a, c);
-            cuda_set_bnd<<<dim3((N+2+16-1)/16, (N+2+16-1)/16, 1), dim3(16, 16, 1)>>>(N, 0, d_x);
-        }
-    }
+    // diffuse(N, 0, x, x0, diff, dt);
+    call_cuda_diffuse(N, 0, d_x, d_x0, diff, dt);
 
+    // SWAP(x0, x);
     SWAP(d_x0, d_x);
 
-    // Advect
-    {
-        cuda_advect<<<dim3((N+16-1)/16, (N+16-1)/16, 1), dim3(16, 16, 1)>>>(N, 0, d_x, d_x0, d_u, d_v, dt);
-        cuda_set_bnd<<<dim3((N+2+16-1)/16, (N+2+16-1)/16, 1), dim3(16, 16, 1)>>>(N, 0, d_x);
-    }
+    // advect(N, 0, x, x0, u, v, dt);
+    call_cuda_advect(N, 0, d_x, d_x0, d_u, d_v, dt);
 
-    // Transfer back to CPU
     HANDLE_ERROR( cudaMemcpy(x, d_x, mem_size, cudaMemcpyDeviceToHost) );
     HANDLE_ERROR( cudaMemcpy(x0, d_x0, mem_size, cudaMemcpyDeviceToHost) );
 }
 
 void cuda_vel_step(int N, float *u, float *v, float *u0, float *v0, float visc, float dt) {
-    add_source(N, u, u0, dt);
-    add_source(N, v, v0, dt);
+    int size = (N + 2) * (N + 2);
+    int mem_size = size * sizeof(float);
 
-    SWAP(u0, u);
-    // SWAP(d_u0, d_u);
+    HANDLE_ERROR( cudaMemcpy(d_u, u, mem_size, cudaMemcpyHostToDevice) );
+    HANDLE_ERROR( cudaMemcpy(d_v, v, mem_size, cudaMemcpyHostToDevice) );
+    HANDLE_ERROR( cudaMemcpy(d_u0, u0, mem_size, cudaMemcpyHostToDevice) );
+    HANDLE_ERROR( cudaMemcpy(d_v0, v0, mem_size, cudaMemcpyHostToDevice) );
 
-    diffuse(N, 1, u, u0, visc, dt);
+    // add_source(N, u, u0, dt);
+    // add_source(N, v, v0, dt);
+    call_cuda_add_source(N, d_u, d_u0, dt);
+    call_cuda_add_source(N, d_v, d_v0, dt);
 
-    SWAP(v0, v);
-    // SWAP(d_v0, d_v);
+    // SWAP(u0, u);
+    SWAP(d_u0, d_u);
 
-    diffuse(N, 2, v, v0, visc, dt);
-    project(N, u, v, u0, v0);
+    // diffuse(N, 1, u, u0, visc, dt);
+    call_cuda_diffuse(N, 1, d_u, d_u0, visc, dt);
 
-    SWAP(u0, u);
-    SWAP(v0, v);
-    // SWAP(d_u0, d_u);
-    // SWAP(d_v0, d_v);
+    // SWAP(v0, v);
+    SWAP(d_v0, d_v);
 
-    advect(N, 1, u, u0, u0, v0, dt);
-    advect(N, 2, v, v0, u0, v0, dt);
-    project(N, u, v, u0, v0);
+    // diffuse(N, 2, v, v0, visc, dt);
+    call_cuda_diffuse(N, 2, d_v, d_v0, visc, dt);
+
+    // project(N, u, v, u0, v0);
+    call_cuda_project(N, d_u, d_v, d_u0, d_v0);
+
+    // SWAP(u0, u);
+    // SWAP(v0, v);
+    SWAP(d_u0, d_u);
+    SWAP(d_v0, d_v);
+
+    // advect(N, 1, u, u0, u0, v0, dt);
+    // advect(N, 2, v, v0, u0, v0, dt);
+    call_cuda_advect(N, 1, d_u, d_u0, d_u0, d_v0, dt);
+    call_cuda_advect(N, 2, d_v, d_v0, d_u0, d_v0, dt);
+
+    // project(N, u, v, u0, v0);
+    call_cuda_project(N, d_u, d_v, d_u0, d_v0);
+
+    HANDLE_ERROR( cudaMemcpy(u, d_u, mem_size, cudaMemcpyDeviceToHost) );
+    HANDLE_ERROR( cudaMemcpy(u0, d_u0, mem_size, cudaMemcpyDeviceToHost) );
+    HANDLE_ERROR( cudaMemcpy(v, d_v, mem_size, cudaMemcpyDeviceToHost) );
+    HANDLE_ERROR( cudaMemcpy(v0, d_v0, mem_size, cudaMemcpyDeviceToHost) );
 }
 
 void cuda_init(int N) {
