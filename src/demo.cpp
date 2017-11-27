@@ -19,6 +19,13 @@ extern void dens_step(int N, float *x, float *x0, float *u, float *v,
 extern void vel_step(int N, float *u, float *v, float *u0, float *v0,
                      float visc, float dt);
 
+extern void cuda_dens_step(int N, float *x, float *x0, const float *u, const float *v,
+                      float diff, float dt);
+extern void cuda_vel_step(int N, float *u, float *v, float *u0, float *v0,
+                     float visc, float dt);
+extern void cuda_init(int N);
+extern void cuda_cleanup();
+
 static void pre_display();
 static void post_display();
 static void key_func(unsigned char key, int x, int y);
@@ -40,7 +47,7 @@ static int omx, omy, mx, my;
 class FluidSolver {
 public:
     FluidSolver()
-        : FluidSolver(64, 0.1f, 0.0f, 0.0f, 5.0f, 100.0f) 
+        : FluidSolver(64, 0.1f, 0.0f, 0.0f, 5.0f, 100.0f)
     {}
 
     FluidSolver(int N, float dt, float diff, float visc, float force, float source)
@@ -188,20 +195,39 @@ protected:
 class SerialFluidSolver : public FluidSolver {
 public:
     SerialFluidSolver()
-        : SerialFluidSolver(64, 0.1f, 0.0f, 0.0f, 5.0f, 100.0f) 
+        : SerialFluidSolver(64, 0.1f, 0.0f, 0.0f, 5.0f, 100.0f)
     {}
 
     SerialFluidSolver(int N, float dt, float diff, float visc, float force, float source)
-        : FluidSolver(N, dt, diff, visc, force, source) 
+        : FluidSolver(N, dt, diff, visc, force, source)
     {}
 
     void update() override {
         vel_step(N, u, v, u_prev, v_prev, visc, dt);
         dens_step(N, dens, dens_prev, u, v, diff, dt);
     }
+};
 
-private:
-        
+class CudaFluidSolver : public FluidSolver {
+public:
+    CudaFluidSolver()
+        : CudaFluidSolver(64, 0.1f, 0.0f, 0.0f, 5.0f, 100.0f)
+    {}
+
+    CudaFluidSolver(int N, float dt, float diff, float visc, float force, float source)
+        : FluidSolver(N, dt, diff, visc, force, source)
+    {
+        cuda_init(N);
+    }
+
+    ~CudaFluidSolver() {
+        cuda_cleanup();
+    }
+
+    void update() override {
+        cuda_vel_step(N, u, v, u_prev, v_prev, visc, dt);
+        cuda_dens_step(N, dens, dens_prev, u, v, diff, dt);
+    }
 };
 
 /*
@@ -209,7 +235,7 @@ private:
    main --- main routine
   ----------------------------------------------------------------------
 */
-SerialFluidSolver *solver = nullptr;
+FluidSolver *solver = nullptr;
 int main(int argc, char **argv) {
     glutInit(&argc, argv);
 
@@ -259,7 +285,8 @@ int main(int argc, char **argv) {
 
     dvel = 0;
 
-    solver = new SerialFluidSolver(N, dt, diff, visc, force, source);
+    /* solver = new SerialFluidSolver(N, dt, diff, visc, force, source); */
+    solver = new CudaFluidSolver(N, dt, diff, visc, force, source);
 
     win_x = 512;
     win_y = 512;

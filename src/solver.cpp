@@ -6,14 +6,14 @@
         x = tmp;                                                               \
     }
 
-void add_source(int N, float *x, float *s, float dt) {
+static void add_source(int N, float *x, float *s, float dt) {
     int size = (N + 2) * (N + 2);
     for (int i = 0; i < size; i++) {
         x[i] += dt * s[i];
     }
 }
 
-void set_bnd(int N, int b, float *x) {
+static void set_bnd(int N, int b, float *x) {
     for (int i = 1; i <= N; i++) {
         x[IX(0, i)]     = b == 1 ? -x[IX(1, i)] : x[IX(1, i)];
         x[IX(N + 1, i)] = b == 1 ? -x[IX(N, i)] : x[IX(N, i)];
@@ -27,7 +27,7 @@ void set_bnd(int N, int b, float *x) {
     x[IX(N + 1, N + 1)] = 0.5f * (x[IX(N, N + 1)] + x[IX(N + 1, N)]);
 }
 
-void lin_solve(int N, int b, float *x, float *x0, float a, float c) {
+static void lin_solve(int N, int b, float *x, float *x0, float a, float c) {
     for (int k = 0; k < 20; k++) {
         for (int i = 1; i <= N; i++) {
             for (int j = 1; j <= N; j++) {
@@ -38,12 +38,12 @@ void lin_solve(int N, int b, float *x, float *x0, float a, float c) {
     }
 }
 
-void diffuse(int N, int b, float *x, float *x0, float diff, float dt) {
+static void diffuse(int N, int b, float *x, float *x0, float diff, float dt) {
     float a = dt * diff * N * N;
     lin_solve(N, b, x, x0, a, 1 + 4 * a);
 }
 
-void advect(int N, int b, float *d, float *d0, float *u, float *v, float dt) {
+static void advect(int N, int b, float *d, float *d0, float *u, float *v, float dt) {
     float dt0 = dt * N;
 
     for (int i = 1; i <= N; i++) {
@@ -77,7 +77,7 @@ void advect(int N, int b, float *d, float *d0, float *u, float *v, float dt) {
     set_bnd(N, b, d);
 }
 
-void project(int N, float *u, float *v, float *p, float *div) {
+static void project(int N, float *u, float *v, float *p, float *div) {
     for (int i = 1; i <= N; i++) {
         for (int j = 1; j <= N; j++) {
             div[IX(i, j)] = -0.5f * (u[IX(i + 1, j)] - u[IX(i - 1, j)] + v[IX(i, j + 1)] - v[IX(i, j - 1)]) / N;
