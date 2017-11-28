@@ -9,6 +9,8 @@
 #include <GL/glut.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cuda_runtime.h>
+#include <chrono>
 
 /* macros */
 #define IX(i, j) ((i) + (N + 2) * (j))
@@ -202,8 +204,12 @@ public:
     {}
 
     void update() override {
+        auto start = std::chrono::high_resolution_clock::now();
         vel_step(N, u, v, u_prev, v_prev, visc, dt);
         dens_step(N, dens, dens_prev, u, v, diff, dt);
+        auto stop = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = stop - start;
+        printf("Update took %5.2f ms\r", elapsed.count() * 1000);
     }
 };
 
@@ -217,16 +223,37 @@ public:
         : FluidSolver(N, dt, diff, visc, force, source)
     {
         cuda_init(N);
+        cudaEventCreate(&velStart);
+        cudaEventCreate(&velStop);
+        cudaEventCreate(&densStart);
+        cudaEventCreate(&densStop);
     }
 
     ~CudaFluidSolver() {
         cuda_cleanup();
+        cudaEventDestroy(velStart);
+        cudaEventDestroy(velStop);
+        cudaEventDestroy(densStart);
+        cudaEventDestroy(densStop);
     }
 
     void update() override {
+        cudaEventRecord(velStart); 
         cuda_vel_step(N, u, v, u_prev, v_prev, visc, dt);
+        cudaEventRecord(velStop);
+        cudaEventRecord(densStart);
         cuda_dens_step(N, dens, dens_prev, u, v, diff, dt);
+        cudaEventRecord(densStop);
+
+        cudaEventSynchronize(densStop);
+        float velMilliseconds, densMilliseconds;
+        cudaEventElapsedTime(&velMilliseconds, velStart, velStop);
+        cudaEventElapsedTime(&densMilliseconds, densStart, densStop);
+
+        printf("Update took %5.2f ms\r", velMilliseconds + densMilliseconds);
     }
+
+    cudaEvent_t velStart, velStop, densStart, densStop;
 };
 
 /*
@@ -240,7 +267,7 @@ int main(int argc, char **argv) {
 
     int N;
     float dt, diff, visc, force, source;
-    if (argc != 1 && argc != 6) {
+    if (argc != 1 && argc != 7) {
         fprintf(stderr, "usage : %s N dt diff visc force source\n",
             "where:\n"
             "\t N      : grid resolution\n"
@@ -254,7 +281,7 @@ int main(int argc, char **argv) {
     }
 
     if (argc == 1) {
-        N = 64;
+        N = 256;
         dt = 0.1f;
         diff = 0.0f;
         visc = 0.0f;
@@ -287,8 +314,8 @@ int main(int argc, char **argv) {
     /* solver = new SerialFluidSolver(N, dt, diff, visc, force, source); */
     solver = new CudaFluidSolver(N, dt, diff, visc, force, source);
 
-    win_x = 512;
-    win_y = 512;
+    win_x = 800;
+    win_y = 800;
     open_glut_window();
 
     glutMainLoop();

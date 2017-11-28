@@ -1,6 +1,9 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
+#define ADD_SOURCE_BLOCK_SIZE 512
+#define BLOCK_SIZE 16
+
 #define HANDLE_ERROR(err) {                                                    \
     if ((err) != cudaSuccess) {                                                \
         fprintf(stderr, "CUDA error %s:%d: %d\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
@@ -29,7 +32,7 @@ __global__ void cuda_add_source(int N, float *x, const float *s, float dt) {
 static void call_cuda_add_source(int N, float *x, const float *s, float dt) {
     int size = (N + 2) * (N + 2);
 
-    const dim3 blockSize(512, 1, 1);
+    const dim3 blockSize(ADD_SOURCE_BLOCK_SIZE, 1, 1);
     const dim3 gridSize((size + blockSize.x - 1) / blockSize.x, 1, 1);
     cuda_add_source<<<gridSize, blockSize>>>(N, x, s, dt);
 }
@@ -96,9 +99,21 @@ __global__ void cuda_lin_solve(int N, int b, float *x, const float *x0, float a,
 }
 
 static void call_cuda_lin_solve(int N, int b, float *x, const float *x0, float a, float c) {
+    const dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE, 1);
+    const dim3 gridSize(
+        (N + blockSize.x - 1) / blockSize.x,
+        (N + blockSize.y - 1) / blockSize.y,
+        1
+    );
+    const dim3 gridSizeHalo(
+        (N + 2 + blockSize.x - 1) / blockSize.x,
+        (N + 2 + blockSize.y - 1) / blockSize.y,
+        1
+    );
+
     for (int k = 0; k < 20; k++) {
-        cuda_lin_solve<<<dim3((N+16-1)/16, (N+16-1)/16, 1), dim3(16, 16, 1)>>>(N, b, x, x0, a, c);
-        cuda_set_bnd<<<dim3((N+2+16-1)/16, (N+2+16-1)/16, 1), dim3(16, 16, 1)>>>(N, b, x);
+        cuda_lin_solve<<<gridSize, blockSize>>>(N, b, x, x0, a, c);
+        cuda_set_bnd<<<gridSizeHalo, blockSize>>>(N, b, x);
     }
 }
 
@@ -154,8 +169,20 @@ __global__ void cuda_advect(int N, int b, float *d, const float *d0, const float
 }
 
 static void call_cuda_advect(int N, int b, float *d, const float *d0, const float *u, const float *v, float dt) {
-    cuda_advect<<<dim3((N+16-1)/16, (N+16-1)/16, 1), dim3(16, 16, 1)>>>(N, b, d, d0, u, v, dt);
-    cuda_set_bnd<<<dim3((N+2+16-1)/16, (N+2+16-1)/16, 1), dim3(16, 16, 1)>>>(N, b, d);
+    const dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE, 1);
+    const dim3 gridSize(
+        (N + blockSize.x - 1) / blockSize.x,
+        (N + blockSize.y - 1) / blockSize.y,
+        1
+    );
+    const dim3 gridSizeHalo(
+        (N + 2 + blockSize.x - 1) / blockSize.x,
+        (N + 2 + blockSize.y - 1) / blockSize.y,
+        1
+    );
+
+    cuda_advect<<<gridSize, blockSize>>>(N, b, d, d0, u, v, dt);
+    cuda_set_bnd<<<gridSizeHalo, blockSize>>>(N, b, d);
 }
 
 static void advect(int N, int b, float *d, float *d0, float *u, float *v, float dt) {
@@ -219,17 +246,29 @@ __global__ void cuda_project1(int N, float *u, float *v, const float *p) {
 }
 
 static void call_cuda_project(int N, float *u, float *v, float *p, float *div) {
-    cuda_project0<<<dim3((N+16-1)/16, (N+16-1)/16, 1), dim3(16, 16, 1)>>>(N, div, p, u, v);
+    const dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE, 1);
+    const dim3 gridSize(
+        (N + blockSize.x - 1) / blockSize.x,
+        (N + blockSize.y - 1) / blockSize.y,
+        1
+    );
+    const dim3 gridSizeHalo(
+        (N + 2 + blockSize.x - 1) / blockSize.x,
+        (N + 2 + blockSize.y - 1) / blockSize.y,
+        1
+    );
 
-    cuda_set_bnd<<<dim3((N+2+16-1)/16, (N+2+16-1)/16, 1), dim3(16, 16, 1)>>>(N, 0, div);
-    cuda_set_bnd<<<dim3((N+2+16-1)/16, (N+2+16-1)/16, 1), dim3(16, 16, 1)>>>(N, 0, p);
+    cuda_project0<<<gridSize, blockSize>>>(N, div, p, u, v);
+
+    cuda_set_bnd<<<gridSizeHalo, blockSize>>>(N, 0, div);
+    cuda_set_bnd<<<gridSizeHalo, blockSize>>>(N, 0, p);
 
     call_cuda_lin_solve(N, 0, p, div, 1, 4);
 
-    cuda_project1<<<dim3((N+16-1)/16, (N+16-1)/16, 1), dim3(16, 16, 1)>>>(N, u, v, p);
+    cuda_project1<<<gridSize, blockSize>>>(N, u, v, p);
 
-    cuda_set_bnd<<<dim3((N+2+16-1)/16, (N+2+16-1)/16, 1), dim3(16, 16, 1)>>>(N, 1, u);
-    cuda_set_bnd<<<dim3((N+2+16-1)/16, (N+2+16-1)/16, 1), dim3(16, 16, 1)>>>(N, 2, v);
+    cuda_set_bnd<<<gridSizeHalo, blockSize>>>(N, 1, u);
+    cuda_set_bnd<<<gridSizeHalo, blockSize>>>(N, 2, v);
 }
 
 static void project(int N, float *u, float *v, float *p, float *div) {
