@@ -15,6 +15,14 @@
 /* macros */
 #define IX(i, j) ((i) + (N + 2) * (j))
 
+#define FRAME_STOP 0
+#define DEFAULT_N 512
+#define WINDOW_WIDTH 800
+#define WINDOW_HEIGHT 800
+
+#define USE_CUDA
+#define USE_PINNED
+
 /* external definitions (from solver.c) */
 extern void dens_step(int N, float *x, float *x0, float *u, float *v,
                       float diff, float dt);
@@ -46,6 +54,8 @@ static int win_x, win_y;
 static int mouse_down[3];
 static int omx, omy, mx, my;
 
+static int frame = 0;
+
 class FluidSolver {
 public:
     FluidSolver()
@@ -57,21 +67,42 @@ public:
     {
         int size = (N + 2) * (N + 2);
 
+#ifdef USE_PINNED
+        cudaMallocHost((void **)&u, size * sizeof(float));
+        cudaMallocHost((void **)&v, size * sizeof(float));
+        cudaMallocHost((void **)&u_prev, size * sizeof(float));
+        cudaMallocHost((void **)&v_prev, size * sizeof(float));
+        cudaMallocHost((void **)&dens, size * sizeof(float));
+        cudaMallocHost((void **)&dens_prev, size * sizeof(float));
+#else
         u = new float[size];
         v = new float[size];
         u_prev = new float[size];
         v_prev = new float[size];
         dens = new float[size];
         dens_prev = new float[size];
+#endif
+
+        clear();
     }
 
     virtual ~FluidSolver() {
-        delete u;
-        delete v;
-        delete u_prev;
-        delete v_prev;
-        delete dens;
-        delete dens_prev;
+#ifdef USE_PINNED
+        cudaFreeHost(u);
+        cudaFreeHost(v);
+        cudaFreeHost(u_prev);
+        cudaFreeHost(v_prev);
+        cudaFreeHost(dens);
+        cudaFreeHost(dens_prev);
+#else
+        /* delete u; */
+        /* delete v; */
+        /* delete u_prev; */
+        /* delete v_prev; */
+        /* delete dens; */
+        /* delete dens_prev; */
+#endif
+        printf("\n\nAverage frame time: %5.2f ms\n", frametime / frame);
     }
 
     void clear() {
@@ -102,7 +133,7 @@ public:
     const float *const getU() const { return u; }
     const float *const getV() const { return v; }
     const float *const getDensity() const { return dens; }
-  
+
     void draw_velocity() const {
         float h = 1.0f / N;
 
@@ -191,6 +222,8 @@ protected:
 
     float *u, *v, *u_prev, *v_prev;
     float *dens, *dens_prev;
+
+    float frametime = 0.0f;
 };
 
 class SerialFluidSolver : public FluidSolver {
@@ -209,7 +242,9 @@ public:
         dens_step(N, dens, dens_prev, u, v, diff, dt);
         auto stop = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = stop - start;
-        printf("Update took %5.2f ms\r", elapsed.count() * 1000);
+        printf("\rUpdate took %5.2f ms", elapsed.count() * 1000);
+
+        frametime += elapsed.count() * 1000;
     }
 };
 
@@ -238,7 +273,7 @@ public:
     }
 
     void update() override {
-        cudaEventRecord(velStart); 
+        cudaEventRecord(velStart);
         cuda_vel_step(N, u, v, u_prev, v_prev, visc, dt);
         cudaEventRecord(velStop);
         cudaEventRecord(densStart);
@@ -250,7 +285,9 @@ public:
         cudaEventElapsedTime(&velMilliseconds, velStart, velStop);
         cudaEventElapsedTime(&densMilliseconds, densStart, densStop);
 
-        printf("Update took %5.2f ms\r", velMilliseconds + densMilliseconds);
+        printf("\rUpdate took %5.2f ms", velMilliseconds + densMilliseconds);
+
+        frametime += velMilliseconds + densMilliseconds;
     }
 
     cudaEvent_t velStart, velStop, densStart, densStop;
@@ -281,7 +318,7 @@ int main(int argc, char **argv) {
     }
 
     if (argc == 1) {
-        N = 256;
+        N = DEFAULT_N;
         dt = 0.1f;
         diff = 0.0f;
         visc = 0.0f;
@@ -301,6 +338,22 @@ int main(int argc, char **argv) {
         source = atof(argv[6]);
     }
 
+    // Print device information (from https://devblogs.nvidia.com/parallelforall/how-query-device-properties-and-handle-errors-cuda-cc/)
+    int nDevices;
+    cudaGetDeviceCount(&nDevices);
+    for (int i = 0; i < nDevices; i++) {
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, i);
+        printf("Device Number: %d\n", i);
+        printf("  Device name: %s\n", prop.name);
+        printf("  Memory Clock Rate (KHz): %d\n",
+               prop.memoryClockRate);
+        printf("  Memory Bus Width (bits): %d\n",
+               prop.memoryBusWidth);
+        printf("  Peak Memory Bandwidth (GB/s): %f\n\n",
+               2.0*prop.memoryClockRate*(prop.memoryBusWidth/8)/1.0e6);
+    }
+
     printf("\n\nHow to use this demo:\n\n"
         "\t Add densities with the right mouse button\n"
         "\t Add velocities with the left mouse button and dragging the mouse\n"
@@ -311,11 +364,14 @@ int main(int argc, char **argv) {
 
     dvel = 0;
 
-    /* solver = new SerialFluidSolver(N, dt, diff, visc, force, source); */
+#ifdef USE_CUDA
     solver = new CudaFluidSolver(N, dt, diff, visc, force, source);
+#else
+    solver = new SerialFluidSolver(N, dt, diff, visc, force, source);
+#endif
 
-    win_x = 800;
-    win_y = 800;
+    win_x = WINDOW_WIDTH;
+    win_y = WINDOW_HEIGHT;
     open_glut_window();
 
     glutMainLoop();
@@ -392,6 +448,12 @@ static void idle_func(void) {
 
     glutSetWindow(win_id);
     glutPostRedisplay();
+
+    frame++;
+    if (FRAME_STOP && frame == FRAME_STOP) {
+        delete solver;
+        exit(0);
+    }
 }
 
 static void display_func(void) {
