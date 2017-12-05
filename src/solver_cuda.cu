@@ -6,6 +6,8 @@
 #define ADD_SOURCE_BLOCK_SIZE 512
 #define BLOCK_SIZE 16
 #define USE_OVERLAP
+#define SUBTILE_DIM 4
+#define USE_COALESCED
 
 #define HANDLE_ERROR(err) {                                                    \
     if ((err) != cudaSuccess) {                                                \
@@ -91,7 +93,120 @@ static void set_bnd(int N, int b, float *x) {
     x[IX(N + 1, N + 1)] = 0.5f * (x[IX(N, N + 1)] + x[IX(N + 1, N)]);
 }
 
-/* executed 2D with N x N */
+#ifdef USE_COALESCED
+__global__ void cuda_lin_solve_coalesced(int N, int b, float *x, const float *x0, float a, float c) {
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int orig_i = tx + blockIdx.x * blockDim.x + 1;
+    int orig_j = (ty + blockIdx.y * blockDim.y) * SUBTILE_DIM + 1;
+
+    __shared__ float tile[BLOCK_SIZE + 2][BLOCK_SIZE * SUBTILE_DIM + 2];
+
+    if (tx < N && ty < N) {
+        // if last row then read in rest of the halo
+        int extra = (ty == BLOCK_SIZE - 1) ? 2 : 0;
+
+        // load entire left side
+        for (int k = 0; k < SUBTILE_DIM + extra; k++) {
+            int i = orig_i, j = orig_j + k;
+            tile[tx][ty * SUBTILE_DIM + k] = x[IX(i - 1, j - 1)];
+        }
+
+        // load right strip
+        if (tx >= BLOCK_SIZE - 2) {
+            for (int k = 0; k < SUBTILE_DIM + extra; k++) {
+                int i = orig_i + 2, j = orig_j + k;
+                tile[tx + 2][ty * SUBTILE_DIM + k] = x[IX(i - 1, j - 1)];
+            }
+        }
+
+        __syncthreads();
+
+        int tile_x = tx + 1;
+        int tile_y = ty * SUBTILE_DIM + 1;
+        for (int k = 0; k < SUBTILE_DIM; k++) {
+            int i = orig_i, j = orig_j + k;
+
+            float top, bot, left, right;
+            top = tile[tile_x][tile_y + k - 1];
+            bot = tile[tile_x][tile_y + k + 1];
+            left = tile[tile_x - 1][tile_y + k];
+            right = tile[tile_x + 1][tile_y + k];
+
+            x[IX(i, j)] = (x0[IX(i, j)] + a * (left + right + top + bot)) / c;
+        }
+    }
+}
+#else
+__global__ void cuda_lin_solve_multiple_shared(int N, int b, float *x, const float *x0, float a, float c) {
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int orig_i = (tx + blockIdx.x * blockDim.x) * SUBTILE_DIM + 1;
+    int orig_j = (ty + blockIdx.y * blockDim.y) * SUBTILE_DIM + 1;
+
+    __shared__ float tile[BLOCK_SIZE * SUBTILE_DIM + 2][BLOCK_SIZE * SUBTILE_DIM + 2];
+
+    if (tx < N && ty < N) {
+        // load upper left corner (BLOCK_SIZE * SUBTILE_DIM x BLOCK_SIZE * SUBTILE_DIM)
+        for (int m = 0; m < SUBTILE_DIM; m++) {
+            for (int n = 0; n < SUBTILE_DIM; n++) {
+                int i = orig_i + m, j = orig_j + n;
+                tile[tx * SUBTILE_DIM + m][ty * SUBTILE_DIM + n] = x[IX(i - 1, j - 1)];
+            }
+        }
+
+        // load right strip (BLOCK_SIZE * SUBTILE_DIM x 2)
+        if (tx == BLOCK_SIZE - 1) {
+            for (int m = 0; m < 2; m++) {
+                for (int n = 0; n < SUBTILE_DIM; n++) {
+                    int i = orig_i + m + SUBTILE_DIM, j = orig_j + n;
+                    tile[BLOCK_SIZE * SUBTILE_DIM + m][ty * SUBTILE_DIM + n] = x[IX(i - 1, j - 1)];
+                }
+            }
+        }
+
+        // load bottom strip (2 x BLOCK_SIZE * SUBTILE_DIM)
+        if (ty == BLOCK_SIZE - 1) {
+            for (int m = 0; m < SUBTILE_DIM; m++) {
+                for (int n = 0; n < 2; n++) {
+                    int i = orig_i + m, j = orig_j + n + SUBTILE_DIM;
+                    tile[tx * SUBTILE_DIM + m][BLOCK_SIZE * SUBTILE_DIM + n] = x[IX(i - 1, j - 1)];
+                }
+            }
+        }
+
+        // load bottom right corner (2 x 2)
+        if (tx == 0 && ty == 0) {
+            for (int m = 0; m < 2; m++) {
+                for (int n = 0; n < 2; n++) {
+                    int i = orig_i + m + BLOCK_SIZE * SUBTILE_DIM, j = orig_j + n + BLOCK_SIZE * SUBTILE_DIM;
+                    tile[BLOCK_SIZE * SUBTILE_DIM + m][BLOCK_SIZE * SUBTILE_DIM + n] = x[IX(i - 1, j - 1)];
+                }
+            }
+        }
+
+        __syncthreads();
+
+        int tilex = tx * SUBTILE_DIM + 1, tiley = ty * SUBTILE_DIM + 1;
+        for (int m = 0; m < SUBTILE_DIM; m++) {
+            for (int n = 0; n < SUBTILE_DIM; n++) {
+                int i = orig_i + m, j = orig_j + n;
+
+                float top, bot, left, right;
+                top = tile[tilex + m][tiley + n - 1];
+                bot = tile[tilex + m][tiley + n + 1];
+                left = tile[tilex + m - 1][tiley + n];
+                right = tile[tilex + m + 1][tiley + n];
+
+                x[IX(i, j)] = (x0[IX(i, j)] + a * (left + right + top + bot)) / c;
+            }
+        }
+    }
+}
+#endif
+
 __global__ void cuda_lin_solve(int N, int b, float *x, const float *x0, float a, float c) {
     int tx = threadIdx.x + blockIdx.x * blockDim.x;
     int ty = threadIdx.y + blockIdx.y * blockDim.y;
@@ -106,11 +221,19 @@ __global__ void cuda_lin_solve(int N, int b, float *x, const float *x0, float a,
 
 static void call_cuda_lin_solve(int N, int b, float *x, const float *x0, float a, float c, cudaStream_t stream = 0) {
     const dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE, 1);
+#ifdef USE_COALESCED
     const dim3 gridSize(
         (N + blockSize.x - 1) / blockSize.x,
-        (N + blockSize.y - 1) / blockSize.y,
+        (N + blockSize.y * SUBTILE_DIM - 1) / (blockSize.y * SUBTILE_DIM),
         1
     );
+#else
+    const dim3 gridSize(
+        (N + blockSize.x * SUBTILE_DIM - 1) / (blockSize.x * SUBTILE_DIM),
+        (N + blockSize.y * SUBTILE_DIM - 1) / (blockSize.y * SUBTILE_DIM),
+        1
+    );
+#endif
     const dim3 gridSizeHalo(
         (N + 2 + blockSize.x - 1) / blockSize.x,
         (N + 2 + blockSize.y - 1) / blockSize.y,
@@ -118,7 +241,11 @@ static void call_cuda_lin_solve(int N, int b, float *x, const float *x0, float a
     );
 
     for (int k = 0; k < 20; k++) {
-        cuda_lin_solve<<<gridSize, blockSize, 0, stream>>>(N, b, x, x0, a, c);
+#ifdef USE_COALESCED
+        cuda_lin_solve_coalesced<<<gridSize, blockSize, 0, stream>>>(N, b, x, x0, a, c);
+#else
+        cuda_lin_solve_multiple_shared<<<gridSize, blockSize, 0, stream>>>(N, b, x, x0, a, c);
+#endif
         cuda_set_bnd<<<gridSizeHalo, blockSize, 0, stream>>>(N, b, x);
     }
 }

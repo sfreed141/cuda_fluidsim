@@ -15,8 +15,8 @@
 /* macros */
 #define IX(i, j) ((i) + (N + 2) * (j))
 
-#define FRAME_STOP 0
-#define DEFAULT_N 512
+#define FRAME_STOP 4
+#define DEFAULT_N 1024
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 800
 
