@@ -1,8 +1,11 @@
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #include <stdio.h>
 
+#define NUM_STREAMS 5
 #define ADD_SOURCE_BLOCK_SIZE 512
 #define BLOCK_SIZE 16
+#define USE_OVERLAP
 
 #define HANDLE_ERROR(err) {                                                    \
     if ((err) != cudaSuccess) {                                                \
@@ -18,6 +21,9 @@
     }
 
 static float *d_u, *d_v, *d_u0, *d_v0, *d_x, *d_x0;
+cudaEvent_t start, stop;
+cudaStream_t stream[NUM_STREAMS] = {0};
+cudaEvent_t uvDoneEvent, projectEvent0, projectEvent1, projectEvent2, x0DoneEvent;
 
 /* will be executed 1D with at least (N+2)^2 threads */
 __global__ void cuda_add_source(int N, float *x, const float *s, float dt) {
@@ -29,12 +35,12 @@ __global__ void cuda_add_source(int N, float *x, const float *s, float dt) {
     }
 }
 
-static void call_cuda_add_source(int N, float *x, const float *s, float dt) {
+static void call_cuda_add_source(int N, float *x, const float *s, float dt, cudaStream_t stream = 0) {
     int size = (N + 2) * (N + 2);
 
     const dim3 blockSize(ADD_SOURCE_BLOCK_SIZE, 1, 1);
     const dim3 gridSize((size + blockSize.x - 1) / blockSize.x, 1, 1);
-    cuda_add_source<<<gridSize, blockSize>>>(N, x, s, dt);
+    cuda_add_source<<<gridSize, blockSize, 0, stream>>>(N, x, s, dt);
 }
 
 static void add_source(int N, float *x, float *s, float dt) {
@@ -98,7 +104,7 @@ __global__ void cuda_lin_solve(int N, int b, float *x, const float *x0, float a,
     }
 }
 
-static void call_cuda_lin_solve(int N, int b, float *x, const float *x0, float a, float c) {
+static void call_cuda_lin_solve(int N, int b, float *x, const float *x0, float a, float c, cudaStream_t stream = 0) {
     const dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE, 1);
     const dim3 gridSize(
         (N + blockSize.x - 1) / blockSize.x,
@@ -112,8 +118,8 @@ static void call_cuda_lin_solve(int N, int b, float *x, const float *x0, float a
     );
 
     for (int k = 0; k < 20; k++) {
-        cuda_lin_solve<<<gridSize, blockSize>>>(N, b, x, x0, a, c);
-        cuda_set_bnd<<<gridSizeHalo, blockSize>>>(N, b, x);
+        cuda_lin_solve<<<gridSize, blockSize, 0, stream>>>(N, b, x, x0, a, c);
+        cuda_set_bnd<<<gridSizeHalo, blockSize, 0, stream>>>(N, b, x);
     }
 }
 
@@ -128,11 +134,11 @@ static void lin_solve(int N, int b, float *x, float *x0, float a, float c) {
     }
 }
 
-static void call_cuda_diffuse(int N, int b, float *x, float *x0, float diff, float dt) {
+static void call_cuda_diffuse(int N, int b, float *x, float *x0, float diff, float dt, cudaStream_t stream = 0) {
     float a = dt * diff * N * N;
     float c = 1 + 4 * a;
 
-    call_cuda_lin_solve(N, b, x, x0, a, c);
+    call_cuda_lin_solve(N, b, x, x0, a, c, stream);
 }
 
 static void diffuse(int N, int b, float *x, float *x0, float diff, float dt) {
@@ -168,7 +174,7 @@ __global__ void cuda_advect(int N, int b, float *d, const float *d0, const float
     }
 }
 
-static void call_cuda_advect(int N, int b, float *d, const float *d0, const float *u, const float *v, float dt) {
+static void call_cuda_advect(int N, int b, float *d, const float *d0, const float *u, const float *v, float dt, cudaStream_t stream = 0) {
     const dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE, 1);
     const dim3 gridSize(
         (N + blockSize.x - 1) / blockSize.x,
@@ -181,8 +187,8 @@ static void call_cuda_advect(int N, int b, float *d, const float *d0, const floa
         1
     );
 
-    cuda_advect<<<gridSize, blockSize>>>(N, b, d, d0, u, v, dt);
-    cuda_set_bnd<<<gridSizeHalo, blockSize>>>(N, b, d);
+    cuda_advect<<<gridSize, blockSize, 0, stream>>>(N, b, d, d0, u, v, dt);
+    cuda_set_bnd<<<gridSizeHalo, blockSize, 0, stream>>>(N, b, d);
 }
 
 static void advect(int N, int b, float *d, float *d0, float *u, float *v, float dt) {
@@ -245,7 +251,7 @@ __global__ void cuda_project1(int N, float *u, float *v, const float *p) {
     }
 }
 
-static void call_cuda_project(int N, float *u, float *v, float *p, float *div) {
+static void call_cuda_project(int N, float *u, float *v, float *p, float *div, cudaStream_t stream = 0) {
     const dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE, 1);
     const dim3 gridSize(
         (N + blockSize.x - 1) / blockSize.x,
@@ -258,17 +264,17 @@ static void call_cuda_project(int N, float *u, float *v, float *p, float *div) {
         1
     );
 
-    cuda_project0<<<gridSize, blockSize>>>(N, div, p, u, v);
+    cuda_project0<<<gridSize, blockSize, 0, stream>>>(N, div, p, u, v);
 
-    cuda_set_bnd<<<gridSizeHalo, blockSize>>>(N, 0, div);
-    cuda_set_bnd<<<gridSizeHalo, blockSize>>>(N, 0, p);
+    cuda_set_bnd<<<gridSizeHalo, blockSize, 0, stream>>>(N, 0, div);
+    cuda_set_bnd<<<gridSizeHalo, blockSize, 0, stream>>>(N, 0, p);
 
-    call_cuda_lin_solve(N, 0, p, div, 1, 4);
+    call_cuda_lin_solve(N, 0, p, div, 1, 4, stream);
 
-    cuda_project1<<<gridSize, blockSize>>>(N, u, v, p);
+    cuda_project1<<<gridSize, blockSize, 0, stream>>>(N, u, v, p);
 
-    cuda_set_bnd<<<gridSizeHalo, blockSize>>>(N, 1, u);
-    cuda_set_bnd<<<gridSizeHalo, blockSize>>>(N, 2, v);
+    cuda_set_bnd<<<gridSizeHalo, blockSize, 0, stream>>>(N, 1, u);
+    cuda_set_bnd<<<gridSizeHalo, blockSize, 0, stream>>>(N, 2, v);
 }
 
 static void project(int N, float *u, float *v, float *p, float *div) {
@@ -294,13 +300,13 @@ static void project(int N, float *u, float *v, float *p, float *div) {
 }
 
 void cuda_dens_step(int N, float *x, float *x0, const float *u, const float *v, float diff, float dt) {
-    int size = (N + 2) * (N + 2);
-    int mem_size = size * sizeof(float);
+    /* int size = (N + 2) * (N + 2); */
+    /* int mem_size = size * sizeof(float); */
 
-    HANDLE_ERROR( cudaMemcpy(d_x, x, mem_size, cudaMemcpyHostToDevice) );
-    HANDLE_ERROR( cudaMemcpy(d_x0, x0, mem_size, cudaMemcpyHostToDevice) );
-    HANDLE_ERROR( cudaMemcpy(d_u, u, mem_size, cudaMemcpyHostToDevice) );
-    HANDLE_ERROR( cudaMemcpy(d_v, v, mem_size, cudaMemcpyHostToDevice) );
+    /* HANDLE_ERROR( cudaMemcpy(d_x, x, mem_size, cudaMemcpyHostToDevice) ); */
+    /* HANDLE_ERROR( cudaMemcpy(d_x0, x0, mem_size, cudaMemcpyHostToDevice) ); */
+    /* HANDLE_ERROR( cudaMemcpy(d_u, u, mem_size, cudaMemcpyHostToDevice) ); */
+    /* HANDLE_ERROR( cudaMemcpy(d_v, v, mem_size, cudaMemcpyHostToDevice) ); */
 
     // add_source(N, x, x0, dt);
     call_cuda_add_source(N, d_x, d_x0, dt);
@@ -317,18 +323,18 @@ void cuda_dens_step(int N, float *x, float *x0, const float *u, const float *v, 
     // advect(N, 0, x, x0, u, v, dt);
     call_cuda_advect(N, 0, d_x, d_x0, d_u, d_v, dt);
 
-    HANDLE_ERROR( cudaMemcpy(x, d_x, mem_size, cudaMemcpyDeviceToHost) );
-    HANDLE_ERROR( cudaMemcpy(x0, d_x0, mem_size, cudaMemcpyDeviceToHost) );
+    /* HANDLE_ERROR( cudaMemcpy(x, d_x, mem_size, cudaMemcpyDeviceToHost) ); */
+    /* HANDLE_ERROR( cudaMemcpy(x0, d_x0, mem_size, cudaMemcpyDeviceToHost) ); */
 }
 
 void cuda_vel_step(int N, float *u, float *v, float *u0, float *v0, float visc, float dt) {
-    int size = (N + 2) * (N + 2);
-    int mem_size = size * sizeof(float);
+    /* int size = (N + 2) * (N + 2); */
+    /* int mem_size = size * sizeof(float); */
 
-    HANDLE_ERROR( cudaMemcpy(d_u, u, mem_size, cudaMemcpyHostToDevice) );
-    HANDLE_ERROR( cudaMemcpy(d_v, v, mem_size, cudaMemcpyHostToDevice) );
-    HANDLE_ERROR( cudaMemcpy(d_u0, u0, mem_size, cudaMemcpyHostToDevice) );
-    HANDLE_ERROR( cudaMemcpy(d_v0, v0, mem_size, cudaMemcpyHostToDevice) );
+    /* HANDLE_ERROR( cudaMemcpy(d_u, u, mem_size, cudaMemcpyHostToDevice) ); */
+    /* HANDLE_ERROR( cudaMemcpy(d_v, v, mem_size, cudaMemcpyHostToDevice) ); */
+    /* HANDLE_ERROR( cudaMemcpy(d_u0, u0, mem_size, cudaMemcpyHostToDevice) ); */
+    /* HANDLE_ERROR( cudaMemcpy(d_v0, v0, mem_size, cudaMemcpyHostToDevice) ); */
 
     // add_source(N, u, u0, dt);
     // add_source(N, v, v0, dt);
@@ -363,10 +369,139 @@ void cuda_vel_step(int N, float *u, float *v, float *u0, float *v0, float visc, 
     // project(N, u, v, u0, v0);
     call_cuda_project(N, d_u, d_v, d_u0, d_v0);
 
+    /* HANDLE_ERROR( cudaMemcpy(u, d_u, mem_size, cudaMemcpyDeviceToHost) ); */
+    /* HANDLE_ERROR( cudaMemcpy(u0, d_u0, mem_size, cudaMemcpyDeviceToHost) ); */
+    /* HANDLE_ERROR( cudaMemcpy(v, d_v, mem_size, cudaMemcpyDeviceToHost) ); */
+    /* HANDLE_ERROR( cudaMemcpy(v0, d_v0, mem_size, cudaMemcpyDeviceToHost) ); */
+}
+
+void cuda_update(float *milliseconds, int N, float *x, float *x0, float *u, float *v, float *u0, float *v0, float diff, float visc, float dt) {
+    int size = (N + 2) * (N + 2);
+    int mem_size = size * sizeof(float);
+
+    cudaProfilerStart();
+
+    cudaEventRecord(start);
+
+#ifdef USE_OVERLAP
+    /* HANDLE_ERROR( cudaMemcpyAsync(d_u, u, mem_size, cudaMemcpyHostToDevice) ); */
+    /* HANDLE_ERROR( cudaMemcpyAsync(d_v, v, mem_size, cudaMemcpyHostToDevice) ); */
+    /* HANDLE_ERROR( cudaMemcpyAsync(d_u0, u0, mem_size, cudaMemcpyHostToDevice) ); */
+    /* HANDLE_ERROR( cudaMemcpyAsync(d_v0, v0, mem_size, cudaMemcpyHostToDevice) ); */
+    /* HANDLE_ERROR( cudaMemcpyAsync(d_x, x, mem_size, cudaMemcpyHostToDevice) ); */
+    /* HANDLE_ERROR( cudaMemcpyAsync(d_x0, x0, mem_size, cudaMemcpyHostToDevice) ); */
+
+    {
+        // add_source and diffuse occur independently for u and v so execute concurrently
+        HANDLE_ERROR( cudaMemcpyAsync(d_u, u, mem_size, cudaMemcpyHostToDevice, stream[0]) );
+        HANDLE_ERROR( cudaMemcpyAsync(d_u0, u0, mem_size, cudaMemcpyHostToDevice, stream[0]) );
+        call_cuda_add_source(N, d_u, d_u0, dt, stream[0]);
+
+        HANDLE_ERROR( cudaMemcpyAsync(d_v, v, mem_size, cudaMemcpyHostToDevice, stream[1]) );
+        HANDLE_ERROR( cudaMemcpyAsync(d_v0, v0, mem_size, cudaMemcpyHostToDevice, stream[1]) );
+        call_cuda_add_source(N, d_v, d_v0, dt, stream[1]);
+
+        SWAP(d_u0, d_u);
+
+        call_cuda_diffuse(N, 1, d_u, d_u0, visc, dt, stream[0]);
+
+        SWAP(d_v0, d_v);
+
+        call_cuda_diffuse(N, 2, d_v, d_v0, visc, dt, stream[1]);
+
+        // start the copies while vel_step is still going
+        HANDLE_ERROR( cudaMemcpyAsync(d_x, x, mem_size, cudaMemcpyHostToDevice, stream[2]) );
+        HANDLE_ERROR( cudaMemcpyAsync(d_x0, x0, mem_size, cudaMemcpyHostToDevice, stream[2]) );
+
+        // projection reads and modifies everything, must wait for other streams
+        /* cudaStreamSynchronize(stream[1]); */
+        cudaEventRecord(projectEvent0, stream[1]);
+        cudaStreamWaitEvent(stream[0], projectEvent0, 0);
+        call_cuda_project(N, d_u, d_v, d_u0, d_v0, stream[0]);
+        /* cudaStreamSynchronize(stream[0]); */
+        cudaEventRecord(projectEvent1, stream[0]);
+        cudaStreamWaitEvent(stream[1], projectEvent1, 0);
+
+        SWAP(d_u0, d_u);
+        SWAP(d_v0, d_v);
+
+        // doesn't modify u0 or v0, also two calls are independent
+        call_cuda_advect(N, 1, d_u, d_u0, d_u0, d_v0, dt, stream[0]);
+        call_cuda_advect(N, 2, d_v, d_v0, d_u0, d_v0, dt, stream[1]);
+
+        // modifies everything, project has to wait for stream[1] to finish, use events so host not blocked
+        /* cudaStreamSynchronize(stream[1]); */
+        cudaEventRecord(projectEvent2, stream[1]);
+        cudaStreamWaitEvent(stream[0], projectEvent2, 0);
+        call_cuda_project(N, d_u, d_v, d_u0, d_v0, stream[0]);
+
+        // for synchronizing the dens_step call_cuda_advect
+        cudaEventRecord(uvDoneEvent, stream[0]);
+
+        // Can copy these back to host while dens_step evaluates (do after call_cuda_project done)
+        HANDLE_ERROR( cudaMemcpyAsync(u, d_u, mem_size, cudaMemcpyDeviceToHost, stream[0]) );
+        HANDLE_ERROR( cudaMemcpyAsync(v, d_v, mem_size, cudaMemcpyDeviceToHost, stream[0]) );
+        HANDLE_ERROR( cudaMemcpyAsync(u0, d_u0, mem_size, cudaMemcpyDeviceToHost, stream[0]) );
+        HANDLE_ERROR( cudaMemcpyAsync(v0, d_v0, mem_size, cudaMemcpyDeviceToHost, stream[0]) );
+    }
+
+    {
+        call_cuda_add_source(N, d_x, d_x0, dt, stream[2]);
+
+        SWAP(d_x0, d_x);
+
+        call_cuda_diffuse(N, 0, d_x, d_x0, diff, dt, stream[2]);
+
+        SWAP(d_x0, d_x);
+
+        // can start copying x0 back to host now
+        /* cudaStreamSynchronize(stream[2]); */
+        cudaEventRecord(x0DoneEvent, stream[2]);
+        cudaStreamWaitEvent(stream[3], x0DoneEvent, 0);
+        HANDLE_ERROR( cudaMemcpyAsync(x0, d_x0, mem_size, cudaMemcpyDeviceToHost, stream[3]) );
+
+        // make sure u and v are up to date
+        cudaStreamWaitEvent(stream[2], uvDoneEvent, 0);
+
+        call_cuda_advect(N, 0, d_x, d_x0, d_u, d_v, dt, stream[2]);
+
+        // copy last thing back to host
+        HANDLE_ERROR( cudaMemcpyAsync(x, d_x, mem_size, cudaMemcpyDeviceToHost, stream[2]) );
+    }
+
+    /* HANDLE_ERROR( cudaMemcpyAsync(u, d_u, mem_size, cudaMemcpyDeviceToHost) ); */
+    /* HANDLE_ERROR( cudaMemcpyAsync(v, d_v, mem_size, cudaMemcpyDeviceToHost) ); */
+    /* HANDLE_ERROR( cudaMemcpyAsync(u0, d_u0, mem_size, cudaMemcpyDeviceToHost) ); */
+    /* HANDLE_ERROR( cudaMemcpyAsync(v0, d_v0, mem_size, cudaMemcpyDeviceToHost) ); */
+    /* HANDLE_ERROR( cudaMemcpyAsync(x, d_x, mem_size, cudaMemcpyDeviceToHost) ); */
+    /* HANDLE_ERROR( cudaMemcpyAsync(x0, d_x0, mem_size, cudaMemcpyDeviceToHost) ); */
+#else
+    HANDLE_ERROR( cudaMemcpy(d_u, u, mem_size, cudaMemcpyHostToDevice) );
+    HANDLE_ERROR( cudaMemcpy(d_v, v, mem_size, cudaMemcpyHostToDevice) );
+    HANDLE_ERROR( cudaMemcpy(d_u0, u0, mem_size, cudaMemcpyHostToDevice) );
+    HANDLE_ERROR( cudaMemcpy(d_v0, v0, mem_size, cudaMemcpyHostToDevice) );
+    HANDLE_ERROR( cudaMemcpy(d_x, x, mem_size, cudaMemcpyHostToDevice) );
+    HANDLE_ERROR( cudaMemcpy(d_x0, x0, mem_size, cudaMemcpyHostToDevice) );
+
+    cuda_vel_step(N, u, v, u0, v0, visc, dt);
+
+    cuda_dens_step(N, x, x0, u, v, diff, dt);
+
     HANDLE_ERROR( cudaMemcpy(u, d_u, mem_size, cudaMemcpyDeviceToHost) );
-    HANDLE_ERROR( cudaMemcpy(u0, d_u0, mem_size, cudaMemcpyDeviceToHost) );
     HANDLE_ERROR( cudaMemcpy(v, d_v, mem_size, cudaMemcpyDeviceToHost) );
+    HANDLE_ERROR( cudaMemcpy(u0, d_u0, mem_size, cudaMemcpyDeviceToHost) );
     HANDLE_ERROR( cudaMemcpy(v0, d_v0, mem_size, cudaMemcpyDeviceToHost) );
+    HANDLE_ERROR( cudaMemcpy(x, d_x, mem_size, cudaMemcpyDeviceToHost) );
+    HANDLE_ERROR( cudaMemcpy(x0, d_x0, mem_size, cudaMemcpyDeviceToHost) );
+#endif
+
+    cudaEventRecord(stop);
+
+    // note this also synchronizes the entire device since event is on default stream
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(milliseconds, start, stop);
+
+    cudaProfilerStop();
 }
 
 void cuda_init(int N) {
@@ -385,6 +520,19 @@ void cuda_init(int N) {
     cudaMemset(&d_v0, 0, size);
     cudaMemset(&d_x, 0, size);
     cudaMemset(&d_x0, 0, size);
+
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventCreate(&uvDoneEvent);
+    cudaEventCreate(&projectEvent0);
+    cudaEventCreate(&projectEvent1);
+    cudaEventCreate(&projectEvent2);
+    cudaEventCreate(&x0DoneEvent);
+
+    for (int i = 0; i < NUM_STREAMS; i++) {
+        HANDLE_ERROR( cudaStreamCreate(&stream[i]) );
+    }
 }
 
 void cuda_cleanup() {
@@ -394,4 +542,17 @@ void cuda_cleanup() {
     cudaFree(d_v0);
     cudaFree(d_x);
     cudaFree(d_x0);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    cudaEventDestroy(uvDoneEvent);
+    cudaEventDestroy(projectEvent0);
+    cudaEventDestroy(projectEvent1);
+    cudaEventDestroy(projectEvent2);
+    cudaEventDestroy(x0DoneEvent);
+
+    for (int i = 0; i < NUM_STREAMS; i++) {
+        HANDLE_ERROR( cudaStreamDestroy(stream[i]) );
+    }
 }

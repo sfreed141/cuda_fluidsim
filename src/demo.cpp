@@ -29,11 +29,12 @@ extern void dens_step(int N, float *x, float *x0, float *u, float *v,
 extern void vel_step(int N, float *u, float *v, float *u0, float *v0,
                      float visc, float dt);
 
-extern void cuda_dens_step(int N, float *x, float *x0, const float *u, const float *v,
-                      float diff, float dt);
-extern void cuda_vel_step(int N, float *u, float *v, float *u0, float *v0,
-                     float visc, float dt);
+/* extern void cuda_dens_step(int N, float *x, float *x0, const float *u, const float *v, */
+/*                       float diff, float dt); */
+/* extern void cuda_vel_step(int N, float *u, float *v, float *u0, float *v0, */
+/*                      float visc, float dt); */
 extern void cuda_init(int N);
+extern void cuda_update(float *milliseconds, int N, float *x, float *x0, float *u, float *v, float *u0, float *v0, float diff, float visc, float dt);
 extern void cuda_cleanup();
 
 static void pre_display();
@@ -95,12 +96,12 @@ public:
         cudaFreeHost(dens);
         cudaFreeHost(dens_prev);
 #else
-        /* delete u; */
-        /* delete v; */
-        /* delete u_prev; */
-        /* delete v_prev; */
-        /* delete dens; */
-        /* delete dens_prev; */
+        delete u;
+        delete v;
+        delete u_prev;
+        delete v_prev;
+        delete dens;
+        delete dens_prev;
 #endif
         printf("\n\nAverage frame time: %5.2f ms\n", frametime / frame);
     }
@@ -258,39 +259,19 @@ public:
         : FluidSolver(N, dt, diff, visc, force, source)
     {
         cuda_init(N);
-        cudaEventCreate(&velStart);
-        cudaEventCreate(&velStop);
-        cudaEventCreate(&densStart);
-        cudaEventCreate(&densStop);
     }
 
     ~CudaFluidSolver() {
         cuda_cleanup();
-        cudaEventDestroy(velStart);
-        cudaEventDestroy(velStop);
-        cudaEventDestroy(densStart);
-        cudaEventDestroy(densStop);
     }
 
     void update() override {
-        cudaEventRecord(velStart);
-        cuda_vel_step(N, u, v, u_prev, v_prev, visc, dt);
-        cudaEventRecord(velStop);
-        cudaEventRecord(densStart);
-        cuda_dens_step(N, dens, dens_prev, u, v, diff, dt);
-        cudaEventRecord(densStop);
+        float milliseconds;
+        cuda_update(&milliseconds, N, dens, dens_prev, u, v, u_prev, v_prev, diff, visc, dt);
 
-        cudaEventSynchronize(densStop);
-        float velMilliseconds, densMilliseconds;
-        cudaEventElapsedTime(&velMilliseconds, velStart, velStop);
-        cudaEventElapsedTime(&densMilliseconds, densStart, densStop);
-
-        printf("\rUpdate took %5.2f ms", velMilliseconds + densMilliseconds);
-
-        frametime += velMilliseconds + densMilliseconds;
+        printf("\rUpdate took %5.2f ms", milliseconds);
+        frametime += milliseconds;
     }
-
-    cudaEvent_t velStart, velStop, densStart, densStop;
 };
 
 /*
