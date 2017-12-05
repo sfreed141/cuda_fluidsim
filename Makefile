@@ -1,5 +1,5 @@
 CC=nvcc
-CFLAGS=-std=c++11 -g -O2 -lineinfo
+CFLAGS=-std=c++11 -g -O2 -lineinfo -arch=sm_52
 LDFLAGS=
 LDLIBS=-lGL -lGLU -lglut
 
